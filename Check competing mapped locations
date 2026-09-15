@@ -1,0 +1,36 @@
+# How many distinct C. elegans coordinate intervals have more than one reported partner location in C. briggsae:
+awk -F '\t' 'NR > 1 {
+    e = $2 FS $3 FS $4
+    b = $5 FS $6 FS $7
+    if (!seen[e, b]++) partners[e]++
+}
+END {
+    for (e in partners)
+        if (partners[e] > 1)
+            print e, partners[e]
+}' data/95_identity_latest/qc/uce95_pairs.tsv \
+  | sort -k1,1 -k2,2n \
+  > data/95_identity_latest/qc/elegans_multiple_partner_locations.txt
+
+wc -l data/95_identity_latest/qc/elegans_multiple_partner_locations.txt
+#output: 37
+
+# Inspect a few examples:
+head -n 10 data/95_identity_latest/qc/elegans_multiple_partner_locations.txt
+
+# How many distinct C. briggssae coordinate intervals have more than one reported partner location in C. elegans:
+awk -F '\t' 'NR > 1 {
+    b = $5 FS $6 FS $7
+    e = $2 FS $3 FS $4
+    if (!seen[b, e]++) partners[b]++
+}
+END {
+    for (b in partners)
+        if (partners[b] > 1)
+            print b, partners[b]
+}' data/95_identity_latest/qc/uce95_pairs.tsv \
+  | sort -k1,1 -k2,2n \
+  > data/95_identity_latest/qc/briggsae_multiple_partner_locations.txt
+
+wc -l data/95_identity_latest/qc/briggsae_multiple_partner_locations.txt
+# Output: 8
