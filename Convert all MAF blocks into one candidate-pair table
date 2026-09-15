@@ -1,0 +1,191 @@
+mkdir -p scripts data/95_identity_latest/qc
+
+cat > scripts/maf_to_uce_pairs.py <<'PY'
+#!/usr/bin/env python3
+import csv
+import glob
+import os
+import sys
+
+ELEGANS_CHR = {
+    "BX284601.5": "I",
+    "BX284602.5": "II",
+    "BX284603.4": "III",
+    "BX284604.4": "IV",
+    "BX284605.5": "V",
+    "BX284606.5": "X",
+}
+BRIGGSAE_CHR = {"I", "II", "III", "IV", "V", "X"}
+BASES = set("ACGT")
+
+def parse_s(line):
+    fields = line.split()
+    if len(fields) != 7 or fields[0] != "s":
+        raise ValueError(f"Invalid MAF s line: {line}")
+    _, name, start, size, strand, source_size, sequence = fields
+    start, size, source_size = map(int, (start, size, source_size))
+    sequence = sequence.upper()
+    if strand not in {"+", "-"}:
+        raise ValueError(f"Invalid strand: {line}")
+    if strand == "+":
+        forward_start = start
+    else:
+        forward_start = source_size - start - size
+    return {
+        "name": name,
+        "start": forward_start,
+        "end": forward_start + size,
+        "strand": strand,
+        "size": size,
+        "seq": sequence,
+    }
+
+def process_block(lines, filename, block_number):
+    rows = [parse_s(line) for line in lines if line.startswith("s ")]
+    elegans = [r for r in rows if r["name"] in ELEGANS_CHR]
+    briggsae = [r for r in rows if r["name"] in BRIGGSAE_CHR]
+
+    if len(elegans) != 1 or len(briggsae) != 1:
+        return None, "missing_or_multiple_species_rows"
+
+    e, b = elegans[0], briggsae[0]
+    if len(e["seq"]) != len(b["seq"]):
+        return None, "unequal_alignment_sequence_lengths"
+    if "-" in e["seq"] or "-" in b["seq"]:
+        return None, "gap"
+    if e["size"] != len(e["seq"]) or b["size"] != len(b["seq"]):
+        return None, "maf_size_disagrees_with_sequence"
+
+    aligned = len(e["seq"])
+    # Count matches only where both bases are ordinary A/C/G/T.
+    matches = sum(
+        x == y and x in BASES
+        for x, y in zip(e["seq"], b["seq"])
+    )
+    ambiguous = sum(
+        x not in BASES or y not in BASES
+        for x, y in zip(e["seq"], b["seq"])
+    )
+    mismatches = aligned - matches - ambiguous
+    identity = 100.0 * matches / aligned if aligned else 0.0
+
+    if matches < 200:
+        return None, "fewer_than_200_matches"
+    if identity < 95.0:
+        return None, "identity_below_95"
+    if ambiguous:
+        return None, "ambiguous_base"
+
+    pair = {
+        "e_chr": ELEGANS_CHR[e["name"]],
+        "e_start": e["start"],
+        "e_end": e["end"],
+        "b_chr": b["name"],
+        "b_start": b["start"],
+        "b_end": b["end"],
+        "e_strand": e["strand"],
+        "b_strand": b["strand"],
+        "aligned_bp": aligned,
+        "matches": matches,
+        "mismatches": mismatches,
+        "identity_pct": f"{identity:.6f}",
+        "source_maf": os.path.basename(filename),
+        "source_block": block_number,
+    }
+    return pair, "pass"
+
+def maf_blocks(filename):
+    block = []
+    number = 0
+    with open(filename) as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                if block:
+                    number += 1
+                    yield number, block
+                    block = []
+            elif line.startswith("a ") or line.startswith("s "):
+                block.append(line)
+        if block:
+            number += 1
+            yield number, block
+
+def main():
+    pattern = sys.argv[1]
+    prefix = sys.argv[2]
+    files = sorted(glob.glob(pattern))
+    if not files:
+        sys.exit(f"No MAF files matched: {pattern}")
+
+    reason_counts = {}
+    pairs = {}
+    raw_passing = 0
+
+    for filename in files:
+        for block_number, block in maf_blocks(filename):
+            pair, reason = process_block(block, filename, block_number)
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            if pair is None:
+                continue
+            raw_passing += 1
+
+            # Deduplicate only identical mapped alignment pairs.
+            key = (
+                pair["e_chr"], pair["e_start"], pair["e_end"],
+                pair["b_chr"], pair["b_start"], pair["b_end"],
+                pair["e_strand"], pair["b_strand"],
+            )
+            pairs.setdefault(key, pair)
+
+    ordered = sorted(
+        pairs.values(),
+        key=lambda p: (
+            p["e_chr"], p["e_start"], p["e_end"],
+            p["b_chr"], p["b_start"], p["b_end"],
+        ),
+    )
+    for number, pair in enumerate(ordered, 1):
+        pair["id"] = f"UCE95_{number:04d}"
+
+    columns = [
+        "id", "e_chr", "e_start", "e_end",
+        "b_chr", "b_start", "b_end",
+        "e_strand", "b_strand", "aligned_bp",
+        "matches", "mismatches", "identity_pct",
+        "source_maf", "source_block",
+    ]
+    with open(prefix + ".tsv", "w", newline="") as out:
+        writer = csv.DictWriter(out, fieldnames=columns, delimiter="\t")
+        writer.writeheader()
+        writer.writerows(ordered)
+
+    with open(prefix + ".elegans.bed", "w") as e_out, \
+         open(prefix + ".briggsae.bed", "w") as b_out:
+        for p in ordered:
+            e_out.write(
+                f'{p["e_chr"]}\t{p["e_start"]}\t{p["e_end"]}\t{p["id"]}\n'
+            )
+            b_out.write(
+                f'{p["b_chr"]}\t{p["b_start"]}\t{p["b_end"]}\t{p["id"]}\n'
+            )
+
+    print(f"MAF files: {len(files)}")
+    for reason, count in sorted(reason_counts.items()):
+        print(f"{reason}: {count}")
+    print(f"Passing blocks before exact-pair deduplication: {raw_passing}")
+    print(f"Distinct mapped pairs: {len(ordered)}")
+    print(f"Output: {prefix}.tsv")
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        sys.exit(
+            "Usage: maf_to_uce_pairs.py "
+            "'data/95_identity_latest/chained_results_*.maf' output_prefix"
+        )
+    main()
+PY
+
+python3 scripts/maf_to_uce_pairs.py \
+  'data/95_identity_latest/chained_results_*.maf' \
+  data/95_identity_latest/qc/uce95_pairs
