@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Annotate retained C. elegans/C. briggsae LASTZ pairs from GFF3.
+
+Usage:
+  python3 annotate_uce95_pairs.py \
+    --pairs data/95_identity_latest/qc/uce95_pairs_no_repeats.tsv \
+    --elegans c_elegans.PRJNA13758.WS291.annotations.gff3 \
+    --briggsae data/c_briggsae_latest/CGC2.softMasked.July2026.braker.named.csq.gff.gz \
+    --output data/95_identity_latest/qc/uce95_pairs_annotated.tsv
+"""
+
+import argparse
+import csv
+import gzip
+from bisect import bisect_left
+from collections import Counter, defaultdict
+from pathlib import Path
+from urllib.parse import unquote
+
+ELEGANS_CHROMOSOMES = {
+    "BX284601.5": "I", "BX284602.5": "II", "BX284603.4": "III",
+    "BX284604.4": "IV", "BX284605.5": "V", "BX284606.5": "X",
+}
+EXONIC_FEATURES = {"CDS", "five_prime_UTR", "three_prime_UTR", "exon"}
+EXPRESSION_FEATURES = {
+    "expressed_sequence_match", "mRNA_region", "transcribed_fragment",
+    "transcript_region",
+}
+RELEVANT = EXONIC_FEATURES | EXPRESSION_FEATURES | {"intron", "gene", "mRNA"}
+
+
+def attributes(raw):
+    result = {}
+    for item in raw.split(";"):
+        if "=" in item:
+            key, value = item.split("=", 1)
+            result[key] = unquote(value)
+    return result
+
+
+def feature_name(attrs):
+    for key in ("gene_name", "Name", "gene", "ID"):
+        if attrs.get(key):
+            return attrs[key]
+    return "NA"
+
+
+def open_text(path):
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path)
+
+
+def read_pairs(path):
+    with open(path, newline="") as stream:
+        reader = csv.DictReader(stream, delimiter="\t")
+        required = {"id", "e_chr", "e_start", "e_end", "b_chr", "b_start", "b_end"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"Pair table lacks columns: {sorted(missing)}")
+        rows = list(reader)
+        original_columns = list(reader.fieldnames)
+    if len({row["id"] for row in rows}) != len(rows):
+        raise ValueError("Pair IDs are not unique")
+    return rows, original_columns
+
+
+def build_pair_index(rows, prefix):
+    index = defaultdict(list)
+    for row in rows:
+        chrom = row[f"{prefix}_chr"]
+        start, end = int(row[f"{prefix}_start"]), int(row[f"{prefix}_end"])
+        if start < 0 or end <= start:
+            raise ValueError(f"Invalid {prefix} interval for {row['id']}")
+        index[chrom].append((start, end, row["id"]))
+    for chrom in index:
+        index[chrom].sort()
+    return index
+
+
+def overlapping_ids(index, chrom, start, end):
+    """Small retained set: inspect only nearby indexed candidate intervals."""
+    intervals = index.get(chrom, [])
+    if not intervals:
+        return []
+    starts = [interval[0] for interval in intervals]
+    stop = bisect_left(starts, end)
+    return [uce_id for candidate_start, candidate_end, uce_id in intervals[:stop]
+            if candidate_end > start]
+
+
+def scan_gff(path, index, chromosome_map, species):
+    hits = defaultdict(lambda: defaultdict(list))
+    genes = defaultdict(list)
+    gene_names = {}
+    transcript_to_gene = {}
+    feature_counts = Counter()
+    with open_text(path) as stream:
+        for line_number, line in enumerate(stream, 1):
+            if line.startswith("#") or not line.strip():
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) < 9:
+                continue
+            chrom, feature = chromosome_map.get(fields[0], fields[0]), fields[2]
+            if feature not in RELEVANT:
+                continue
+            try:
+                # GFF3 is 1-based inclusive; pair TSV/BED is 0-based half-open.
+                start, end = int(fields[3]) - 1, int(fields[4])
+            except ValueError:
+                continue
+            if start < 0 or end <= start:
+                continue
+            attrs = attributes(fields[8])
+            feature_counts[feature] += 1
+            if feature == "gene":
+                gene_id = attrs.get("ID", f"unnamed_gene_{line_number}")
+                name = feature_name(attrs)
+                gene_names[gene_id] = name
+                genes[chrom].append((start, end, gene_id, name))
+            elif feature == "mRNA" and attrs.get("ID"):
+                transcript_to_gene[attrs["ID"]] = attrs.get("Parent", "").split(",")[0]
+
+            ids = overlapping_ids(index, chrom, start, end)
+            if not ids or feature in {"gene", "mRNA"}:
+                continue
+            record = (start, end, attrs.get("Parent", ""), feature_name(attrs))
+            for uce_id in ids:
+                # Expression tracks can contain many overlapping records. Only
+                # the hit count and one example are needed for classification.
+                if feature in EXPRESSION_FEATURES:
+                    entry = hits[uce_id][feature]
+                    if not entry:
+                        entry.append(record)
+                    entry.append(None)
+                else:
+                    hits[uce_id][feature].append(record)
+    for chrom in genes:
+        genes[chrom].sort()
+    print(f"{species}: feature records scanned: {dict(feature_counts)}")
+    return hits, genes, gene_names, transcript_to_gene
+
+
+def overlaps(start, end, feature_start, feature_end):
+    return start < feature_end and feature_start < end
+
+
+def gene_context(genes, chrom, start, end):
+    same_chromosome = genes.get(chrom, [])
+    overlapping = set()
+    upstream_distance = downstream_distance = None
+    upstream = downstream = set()
+    for gene_start, gene_end, _, name in same_chromosome:
+        if overlaps(start, end, gene_start, gene_end):
+            overlapping.add(name)
+        elif gene_end <= start:
+            gap = start - gene_end
+            if upstream_distance is None or gap < upstream_distance:
+                upstream_distance, upstream = gap, {name}
+            elif gap == upstream_distance:
+                upstream.add(name)
+        elif gene_start >= end:
+            gap = gene_start - end
+            if downstream_distance is None or gap < downstream_distance:
+                downstream_distance, downstream = gap, {name}
+            elif gap == downstream_distance:
+                downstream.add(name)
+    return (
+        ",".join(sorted(overlapping)) or "NA",
+        ",".join(sorted(upstream)) or "NA",
+        upstream_distance if upstream_distance is not None else "NA",
+        ",".join(sorted(downstream)) or "NA",
+        downstream_distance if downstream_distance is not None else "NA",
+    )
+
+
+def classify(row, prefix, scanned, utr_available, expression_available):
+    hits, genes, gene_names, transcript_to_gene = scanned
+    uce_id = row["id"]
+    chrom = row[f"{prefix}_chr"]
+    start, end = int(row[f"{prefix}_start"]), int(row[f"{prefix}_end"])
+    feature_hits = hits.get(uce_id, {})
+    overlapping, upstream, up_gap, downstream, down_gap = gene_context(
+        genes, chrom, start, end
+    )
+    has_cds = bool(feature_hits.get("CDS"))
+    has_utr = bool(feature_hits.get("five_prime_UTR") or
+                   feature_hits.get("three_prime_UTR"))
+    exon_records = feature_hits.get("exon", [])
+    coding_exon = False
+    for _, _, parents, _ in exon_records:
+        for parent in parents.split(","):
+            if parent in transcript_to_gene:
+                coding_exon = True
+    has_intron = bool(feature_hits.get("intron"))
+    evidence_count = sum(len(feature_hits.get(ft, [])) -
+                         (1 if feature_hits.get(ft) else 0)
+                         for ft in EXPRESSION_FEATURES)
+
+    if has_cds:
+        region = "CDS"
+    elif has_utr:
+        region = "UTR"
+    elif exon_records:
+        region = "other_exon"
+    elif has_intron:
+        region = "annotated_intron"
+    elif overlapping != "NA":
+        region = "genic_non_exonic_unresolved"
+    else:
+        region = "intergenic"
+
+    if has_cds or has_utr or coding_exon:
+        transcript_class = "exonic"
+    elif exon_records or evidence_count:
+        transcript_class = "possibly_exonic"
+    else:
+        # Briggsae lacks EST/mRNA alignment tracks; a zero is not proof that
+        # the locus is not transcribed. Keep the result unresolved.
+        transcript_class = "unresolved"
+
+    if overlapping != "NA":
+        closest, closest_gap = overlapping, 0
+    else:
+        options = []
+        if up_gap != "NA":
+            options.append((up_gap, upstream))
+        if down_gap != "NA":
+            options.append((down_gap, downstream))
+        if options:
+            closest_gap = min(distance for distance, _ in options)
+            closest = ",".join(sorted({name for distance, names in options
+                                       if distance == closest_gap
+                                       for name in names.split(",")}))
+        else:
+            closest, closest_gap = "NA", "NA"
+
+    return {
+        f"{prefix}_region_priority": region,
+        f"{prefix}_transcript_class": transcript_class,
+        f"{prefix}_overlapping_genes": overlapping,
+        f"{prefix}_closest_gene": closest,
+        f"{prefix}_closest_distance_bp": closest_gap,
+        f"{prefix}_upstream_gene": upstream,
+        f"{prefix}_upstream_distance_bp": up_gap,
+        f"{prefix}_downstream_gene": downstream,
+        f"{prefix}_downstream_distance_bp": down_gap,
+        f"{prefix}_CDS_overlap": "yes" if has_cds else "no",
+        f"{prefix}_UTR_overlap": ("yes" if has_utr else "no")
+                                 if utr_available else "not_annotated",
+        f"{prefix}_exon_overlap": "yes" if exon_records else "no",
+        f"{prefix}_intron_overlap": "yes" if has_intron else "no",
+        f"{prefix}_expression_record_count": evidence_count if expression_available
+                                               else "not_available",
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pairs", required=True)
+    parser.add_argument("--elegans", required=True)
+    parser.add_argument("--briggsae", required=True)
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+    rows, original_columns = read_pairs(args.pairs)
+    e_index, b_index = build_pair_index(rows, "e"), build_pair_index(rows, "b")
+    e_scanned = scan_gff(args.elegans, e_index, ELEGANS_CHROMOSOMES, "elegans")
+    b_scanned = scan_gff(args.briggsae, b_index, {}, "briggsae")
+    added = []
+    for prefix in ("e", "b"):
+        added += [
+            f"{prefix}_region_priority", f"{prefix}_transcript_class",
+            f"{prefix}_overlapping_genes", f"{prefix}_closest_gene",
+            f"{prefix}_closest_distance_bp", f"{prefix}_upstream_gene",
+            f"{prefix}_upstream_distance_bp", f"{prefix}_downstream_gene",
+            f"{prefix}_downstream_distance_bp", f"{prefix}_CDS_overlap",
+            f"{prefix}_UTR_overlap", f"{prefix}_exon_overlap",
+            f"{prefix}_intron_overlap", f"{prefix}_expression_record_count",
+        ]
+    added += ["pair_transcript_class", "non_exonic_assessment"]
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, "w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=original_columns + added,
+                                delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            row.update(classify(row, "e", e_scanned, True, True))
+            row.update(classify(row, "b", b_scanned, False, False))
+            if "exonic" in (row["e_transcript_class"], row["b_transcript_class"]):
+                row["pair_transcript_class"] = "exonic_in_at_least_one_species"
+            elif "possibly_exonic" in (row["e_transcript_class"],
+                                       row["b_transcript_class"]):
+                row["pair_transcript_class"] = "possibly_exonic"
+            else:
+                row["pair_transcript_class"] = "unresolved"
+            row["non_exonic_assessment"] = "not_assessable_without_briggsae_EST_mRNA_data"
+            writer.writerow(row)
+    print(f"Annotated {len(rows)} pairs -> {args.output}")
+
+
+if __name__ == "__main__":
+    main()
